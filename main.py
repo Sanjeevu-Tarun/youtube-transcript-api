@@ -10,8 +10,9 @@ def transcript():
     if not video_id:
         return jsonify({"error": "missing videoId"}), 400
     try:
-        entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
-        text = " ".join(e["text"] for e in entries)
+        ytt_api = YouTubeTranscriptApi()
+        fetched = ytt_api.fetch(video_id)
+        text = " ".join(snippet.text for snippet in fetched)
         return jsonify({"transcript": text[:5000]})
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify({"transcript": ""}), 200
