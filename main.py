@@ -12,12 +12,20 @@ def transcript():
     try:
         ytt_api = YouTubeTranscriptApi()
         fetched = ytt_api.fetch(video_id)
-        text = " ".join(snippet.text for snippet in fetched)
+        # Handle both object-style and dict-style snippet formats
+        parts = []
+        for snippet in fetched:
+            try:
+                parts.append(snippet.text)
+            except AttributeError:
+                parts.append(snippet.get("text", ""))
+        text = " ".join(parts)
         return jsonify({"transcript": text[:5000]})
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify({"transcript": ""}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Return 200 with empty transcript so Android app falls back to description gracefully
+        return jsonify({"transcript": "", "error": str(e)}), 200
 
 @app.route("/health")
 def health():
