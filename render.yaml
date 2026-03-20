@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: youtube-transcript-api
-    runtime: docker
-    plan: free          # change to "starter" ($7/mo) for always-on
-    envVars:
-      - key: SECRET_TOKEN
-        sync: false     # set this in Render dashboard — leave blank for open access
+    name: youtube-transcript-server
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT
