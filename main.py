@@ -11,8 +11,7 @@ app = Flask(__name__)
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 
-def search_youtube_video_ids(query: str, max_results: int = 5) -> list:
-    """Search YouTube Data API v3 for video IDs matching the query."""
+def search_youtube_video_ids(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
     params = urllib.parse.urlencode({
@@ -30,8 +29,11 @@ def search_youtube_video_ids(query: str, max_results: int = 5) -> list:
         resp = urllib.request.urlopen(req, timeout=8)
         data = json.loads(resp.read().decode("utf-8"))
         return [
-            {"videoId": item["id"]["videoId"], "title": item["snippet"]["title"],
-             "channel": item["snippet"]["channelTitle"]}
+            {
+                "videoId": item["id"]["videoId"],
+                "title": item["snippet"]["title"],
+                "channel": item["snippet"]["channelTitle"]
+            }
             for item in data.get("items", [])
             if item.get("id", {}).get("videoId")
         ]
@@ -40,42 +42,55 @@ def search_youtube_video_ids(query: str, max_results: int = 5) -> list:
         return []
 
 
-def fetch_transcript(video_id: str) -> str:
-    """Fetch transcript for a video ID. Returns text or empty string."""
+def fetch_transcript(video_id: str) -> tuple:
+    """
+    Returns (transcript_text, status_reason).
+    Tries manual English → auto English → any auto-generated.
+    """
     try:
         ytt_api = YouTubeTranscriptApi()
         transcript_list = ytt_api.list(video_id)
 
+        # List all available transcripts for debugging
+        available = []
+        try:
+            for t in transcript_list:
+                available.append(f"{t.language_code}(generated={t.is_generated})")
+        except Exception:
+            pass
+
         fetched = None
-        # Priority 1: manual English
+        method = ""
+
         try:
             fetched = transcript_list.find_manually_created_transcript(
                 ["en", "en-US", "en-GB"]
             ).fetch()
+            method = "manual-en"
         except Exception:
             pass
 
-        # Priority 2: auto-generated English
         if fetched is None:
             try:
                 fetched = transcript_list.find_generated_transcript(
                     ["en", "en-US", "en-GB"]
                 ).fetch()
+                method = "auto-en"
             except Exception:
                 pass
 
-        # Priority 3: any auto-generated
         if fetched is None:
             try:
                 for t in transcript_list:
                     if t.is_generated:
                         fetched = t.fetch()
+                        method = f"auto-{t.language_code}"
                         break
             except Exception:
                 pass
 
         if fetched is None:
-            return ""
+            return "", f"no_captions_available(found: {available})"
 
         parts = []
         for snippet in fetched:
@@ -84,67 +99,81 @@ def fetch_transcript(video_id: str) -> str:
             except AttributeError:
                 parts.append(snippet.get("text", ""))
 
-        return " ".join(parts)[:5000]
+        text = " ".join(parts)[:5000]
+        return text, f"success-{method}"
 
-    except (TranscriptsDisabled, NoTranscriptFound):
-        return ""
+    except TranscriptsDisabled:
+        return "", "transcripts_disabled"
+    except NoTranscriptFound:
+        return "", "no_transcript_found"
     except Exception as e:
-        print(f"Transcript fetch failed for {video_id}: {e}")
-        return ""
+        return "", f"error: {str(e)}"
 
 
 @app.route("/transcript")
 def transcript():
-    """
-    Two modes:
-      1. ?videoId=XXX         — fetch transcript for a specific video ID
-      2. ?device=Samsung+S25+Ultra — search YouTube API, return first transcript found
-    """
     video_id = request.args.get("videoId")
     device   = request.args.get("device")
+    debug    = request.args.get("debug", "false").lower() == "true"
 
     if not video_id and not device:
         return jsonify({"error": "Provide videoId or device param"}), 400
 
     # Mode 1: direct video ID
     if video_id:
-        text = fetch_transcript(video_id)
-        return jsonify({"transcript": text, "videoId": video_id})
+        text, reason = fetch_transcript(video_id)
+        result = {"transcript": text, "videoId": video_id}
+        if debug or not text:
+            result["reason"] = reason
+        return jsonify(result)
 
-    # Mode 2: device name — search YouTube API then fetch transcripts
+    # Mode 2: device name search
     if not YOUTUBE_API_KEY:
-        return jsonify({
-            "transcript": "",
-            "error": "YOUTUBE_API_KEY not set on server"
-        }), 200
+        return jsonify({"transcript": "", "error": "YOUTUBE_API_KEY not set"}), 200
 
-    videos = search_youtube_video_ids(f"{device} review", max_results=5)
+    videos = search_youtube_video_ids(f"{device} review", max_results=10)
 
     if not videos:
-        return jsonify({"transcript": "", "error": "No videos found"}), 200
+        return jsonify({"transcript": "", "error": "YouTube API returned no videos"}), 200
 
-    # Try each video until we get a transcript
+    results = []
     for video in videos:
         vid = video["videoId"]
-        text = fetch_transcript(vid)
+        text, reason = fetch_transcript(vid)
+        results.append({
+            "videoId": vid,
+            "title": video.get("title", ""),
+            "channel": video.get("channel", ""),
+            "transcript_length": len(text),
+            "reason": reason,
+            "transcript_preview": text[:200] if text else ""
+        })
         if text:
-            return jsonify({
+            # Found one — return it (with debug info if requested)
+            response = {
                 "transcript": text,
                 "videoId": vid,
                 "title": video.get("title", ""),
                 "channel": video.get("channel", "")
-            })
+            }
+            if debug:
+                response["all_tried"] = results
+            return jsonify(response)
 
+    # None worked — return full debug info so we can see WHY
     return jsonify({
         "transcript": "",
-        "error": f"No captions available for top {len(videos)} results"
+        "error": f"No captions in top {len(videos)} results",
+        "videos_tried": results
     }), 200
 
 
 @app.route("/health")
 def health():
-    api_key_set = bool(YOUTUBE_API_KEY)
-    return jsonify({"status": "ok", "youtube_api_key_set": api_key_set}), 200
+    return jsonify({
+        "status": "ok",
+        "youtube_api_key_set": bool(YOUTUBE_API_KEY)
+    }), 200
 
 
 if __name__ == "__main__":
