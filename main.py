@@ -11,51 +11,50 @@ app = Flask(__name__)
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
+# SOCS cookie bypasses YouTube's GDPR consent gate
+# This is the same cookie a browser sets after clicking "Accept all"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Cookie": "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AwGgJlbiACIAME; CONSENT=YES+cb; GPS=1; YSC=x1234; VISITOR_INFO1_LIVE=x1234",
 }
 
 
-def get_caption_url_from_watch_page(video_id: str) -> str | None:
-    """
-    Fetch the YouTube watch page and extract caption track URL directly.
-    The watch page HTML contains ytInitialPlayerResponse with captionTracks.
-    This approach does not require PO tokens or Innertube API keys.
-    """
-    url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
+def fetch_watch_page(video_id: str) -> str | None:
+    url = f"https://www.youtube.com/watch?v={video_id}&hl=en&gl=US"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         resp = urllib.request.urlopen(req, timeout=12)
-        html = resp.read().decode("utf-8", errors="replace")
+        return resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         print(f"Watch page fetch failed for {video_id}: {e}")
         return None
 
-    # Extract ytInitialPlayerResponse JSON from the page
-    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:\s*</script>|\s*var\s)', html)
+
+def extract_caption_url(html: str, video_id: str) -> str | None:
+    # Find ytInitialPlayerResponse
+    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{)', html)
     if not match:
-        # Fallback: broader match
-        match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+)', html)
-        if not match:
-            print(f"ytInitialPlayerResponse not found for {video_id}")
-            return None
+        print(f"ytInitialPlayerResponse not found for {video_id}")
+        return None
+
+    # Extract balanced JSON
+    start = match.start(1)
+    depth = 0
+    end = start
+    for i in range(start, min(start + 2_000_000, len(html))):
+        c = html[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
 
     try:
-        # Find balanced JSON by counting braces
-        raw = match.group(1)
-        depth = 0
-        end = 0
-        for i, ch in enumerate(raw):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        player_data = json.loads(raw[:end])
+        player_data = json.loads(html[start:end])
     except Exception as e:
         print(f"JSON parse failed for {video_id}: {e}")
         return None
@@ -68,10 +67,9 @@ def get_caption_url_from_watch_page(video_id: str) -> str | None:
     )
 
     if not tracks:
-        print(f"No captionTracks in player response for {video_id}")
+        print(f"No captionTracks for {video_id}")
         return None
 
-    # Score: manual English = 0, auto English = 1, auto other = 2, rest = 3
     def score(t):
         lang = t.get("languageCode", "")
         kind = t.get("kind", "")
@@ -81,26 +79,23 @@ def get_caption_url_from_watch_page(video_id: str) -> str | None:
         return 3
 
     tracks.sort(key=score)
-    base_url = tracks[0].get("baseUrl", "")
-    print(f"Found {len(tracks)} tracks for {video_id}, using lang={tracks[0].get('languageCode')} kind={tracks[0].get('kind','')}")
-    return base_url if base_url else None
+    best = tracks[0]
+    print(f"Using track lang={best.get('languageCode')} kind={best.get('kind','manual')} for {video_id}")
+    return best.get("baseUrl", "") or None
 
 
 def fetch_caption_text(caption_url: str) -> str:
-    """Download and parse caption XML/JSON into plain text."""
     try:
-        # Request JSON3 format
         url = caption_url + ("&fmt=json3" if "?" in caption_url else "?fmt=json3")
         req = urllib.request.Request(url, headers=HEADERS)
         resp = urllib.request.urlopen(req, timeout=10)
         raw = resp.read().decode("utf-8", errors="replace")
 
-        # Try JSON3 format
+        # JSON3 format
         try:
             data = json.loads(raw)
-            events = data.get("events", [])
             parts = []
-            for event in events:
+            for event in data.get("events", []):
                 for seg in event.get("segs", []):
                     text = seg.get("utf8", "").strip()
                     if text and text != "\n":
@@ -111,10 +106,10 @@ def fetch_caption_text(caption_url: str) -> str:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: XML
+        # XML fallback
         try:
             root = ET.fromstring(raw)
-            parts = [html_lib.unescape(elem.text or "").strip() for elem in root.iter("text")]
+            parts = [html_lib.unescape(e.text or "").strip() for e in root.iter("text")]
             return " ".join(p for p in parts if p)[:5000]
         except Exception:
             pass
@@ -126,43 +121,36 @@ def fetch_caption_text(caption_url: str) -> str:
 
 
 def get_transcript(video_id: str) -> tuple:
-    """Returns (transcript_text, status)."""
-    caption_url = get_caption_url_from_watch_page(video_id)
+    html = fetch_watch_page(video_id)
+    if not html:
+        return "", "watch_page_fetch_failed"
+    if "consent.youtube.com" in html and "captionTracks" not in html:
+        return "", "consent_gate_not_bypassed"
+    caption_url = extract_caption_url(html, video_id)
     if not caption_url:
         return "", "no_caption_track_found"
     text = fetch_caption_text(caption_url)
-    if text:
-        return text, "success"
-    return "", "caption_fetch_failed"
+    return (text, "success") if text else ("", "caption_fetch_failed")
 
 
 def search_youtube(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
     params = urllib.parse.urlencode({
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "maxResults": max_results,
-        "relevanceLanguage": "en",
-        "order": "relevance",
-        "key": YOUTUBE_API_KEY
+        "part": "snippet", "q": query, "type": "video",
+        "maxResults": max_results, "relevanceLanguage": "en",
+        "order": "relevance", "key": YOUTUBE_API_KEY
     })
     try:
         req = urllib.request.Request(
             f"https://www.googleapis.com/youtube/v3/search?{params}",
             headers={"Accept": "application/json"}
         )
-        resp = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(resp.read().decode("utf-8"))
+        data = json.loads(urllib.request.urlopen(req, timeout=8).read().decode("utf-8"))
         return [
-            {
-                "videoId": item["id"]["videoId"],
-                "title": item["snippet"]["title"],
-                "channel": item["snippet"]["channelTitle"]
-            }
-            for item in data.get("items", [])
-            if item.get("id", {}).get("videoId")
+            {"videoId": i["id"]["videoId"], "title": i["snippet"]["title"],
+             "channel": i["snippet"]["channelTitle"]}
+            for i in data.get("items", []) if i.get("id", {}).get("videoId")
         ]
     except Exception as e:
         print(f"YouTube search failed: {e}")
@@ -178,7 +166,6 @@ def transcript():
     if not video_id and not device:
         return jsonify({"error": "Provide videoId or device param"}), 400
 
-    # Mode 1: direct video ID
     if video_id:
         text, status = get_transcript(video_id)
         result = {"transcript": text, "videoId": video_id}
@@ -186,7 +173,6 @@ def transcript():
             result["status"] = status
         return jsonify(result)
 
-    # Mode 2: device name search
     videos = search_youtube(f"{device} review", max_results=10)
     if not videos:
         return jsonify({"transcript": "", "error": "No videos found"}), 200
@@ -197,65 +183,35 @@ def transcript():
         text, status = get_transcript(vid)
         tried.append({**video, "status": status, "length": len(text)})
         if text:
-            result = {
-                "transcript": text,
-                "videoId": vid,
-                "title": video.get("title", ""),
-                "channel": video.get("channel", "")
-            }
+            result = {"transcript": text, "videoId": vid,
+                      "title": video.get("title", ""), "channel": video.get("channel", "")}
             if debug:
                 result["tried"] = tried
             return jsonify(result)
 
-    return jsonify({
-        "transcript": "",
-        "error": f"No captions in top {len(videos)} results",
-        "videos_tried": tried
-    }), 200
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "youtube_api_key_set": bool(YOUTUBE_API_KEY),
-        "method": "watch_page_scrape"
-    }), 200
+    return jsonify({"transcript": "", "error": f"No captions in top {len(videos)} results",
+                    "videos_tried": tried}), 200
 
 
 @app.route("/debug-page")
 def debug_page():
-    """Shows first 3000 chars of YouTube watch page + what was found."""
     video_id = request.args.get("videoId", "a4NJNdHqs_I")
-    url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        resp = urllib.request.urlopen(req, timeout=12)
-        html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    has_player_response = "ytInitialPlayerResponse" in html
-    has_caption_tracks  = "captionTracks" in html
-    has_consent         = "consent.youtube.com" in html or "CONSENT" in html
-    has_bot_check       = "detected unusual traffic" in html or "verify" in html.lower()
-
-    # Extract snippet around captionTracks if present
-    caption_snippet = ""
+    html = fetch_watch_page(video_id) or ""
     idx = html.find("captionTracks")
-    if idx > 0:
-        caption_snippet = html[idx:idx+500]
-
     return jsonify({
         "video_id": video_id,
         "page_length": len(html),
-        "has_ytInitialPlayerResponse": has_player_response,
-        "has_captionTracks": has_caption_tracks,
-        "has_consent_redirect": has_consent,
-        "has_bot_check": has_bot_check,
-        "caption_snippet": caption_snippet,
-        "page_start": html[:500]
+        "has_ytInitialPlayerResponse": "ytInitialPlayerResponse" in html,
+        "has_captionTracks": "captionTracks" in html,
+        "has_consent_redirect": "consent.youtube.com" in html,
+        "caption_snippet": html[idx:idx+300] if idx > 0 else "",
+        "page_start": html[:300]
     })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "youtube_api_key_set": bool(YOUTUBE_API_KEY)}), 200
 
 
 if __name__ == "__main__":
