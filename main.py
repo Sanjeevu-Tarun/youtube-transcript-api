@@ -33,41 +33,23 @@ def fetch_watch_page(video_id: str) -> str | None:
 
 
 def extract_caption_url(html: str, video_id: str) -> str | None:
-    # Find ytInitialPlayerResponse
-    match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{)', html)
+    # Directly regex-extract captionTracks array — much faster than parsing full JSON
+    # captionTracks appears as: "captionTracks":[{"baseUrl":"...","languageCode":"en",...},...]
+    match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])\s*,\s*"audioTracks"', html, re.DOTALL)
     if not match:
-        print(f"ytInitialPlayerResponse not found for {video_id}")
+        # Fallback: try without the audioTracks anchor
+        match = re.search(r'"captionTracks"\s*:\s*(\[.*?\])\s*[,}]', html, re.DOTALL)
+    if not match:
+        print(f"captionTracks not found in page for {video_id}")
         return None
-
-    # Extract balanced JSON
-    start = match.start(1)
-    depth = 0
-    end = start
-    for i in range(start, min(start + 2_000_000, len(html))):
-        c = html[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
 
     try:
-        player_data = json.loads(html[start:end])
+        tracks = json.loads(match.group(1))
     except Exception as e:
-        print(f"JSON parse failed for {video_id}: {e}")
+        print(f"captionTracks JSON parse failed for {video_id}: {e}")
         return None
 
-    tracks = (
-        player_data
-        .get("captions", {})
-        .get("playerCaptionsTracklistRenderer", {})
-        .get("captionTracks", [])
-    )
-
     if not tracks:
-        print(f"No captionTracks for {video_id}")
         return None
 
     def score(t):
