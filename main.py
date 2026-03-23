@@ -223,5 +223,40 @@ def health():
     }), 200
 
 
+@app.route("/debug-page")
+def debug_page():
+    """Shows first 3000 chars of YouTube watch page + what was found."""
+    video_id = request.args.get("videoId", "a4NJNdHqs_I")
+    url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        resp = urllib.request.urlopen(req, timeout=12)
+        html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    has_player_response = "ytInitialPlayerResponse" in html
+    has_caption_tracks  = "captionTracks" in html
+    has_consent         = "consent.youtube.com" in html or "CONSENT" in html
+    has_bot_check       = "detected unusual traffic" in html or "verify" in html.lower()
+
+    # Extract snippet around captionTracks if present
+    caption_snippet = ""
+    idx = html.find("captionTracks")
+    if idx > 0:
+        caption_snippet = html[idx:idx+500]
+
+    return jsonify({
+        "video_id": video_id,
+        "page_length": len(html),
+        "has_ytInitialPlayerResponse": has_player_response,
+        "has_captionTracks": has_caption_tracks,
+        "has_consent_redirect": has_consent,
+        "has_bot_check": has_bot_check,
+        "caption_snippet": caption_snippet,
+        "page_start": html[:500]
+    })
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
